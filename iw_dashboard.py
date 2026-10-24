@@ -8,12 +8,14 @@ to where the tile actually is.
 
 Run with: streamlit run iw_dashboard.py   (data files go in ./data, see README)
 
-Files expected next to this script
-----------------------------------
+Files expected in ./data (and the .bin files next to this script)
+----------------------------------------------------------------
 required  ckpt_improved_v2_s2.pth                     the detector
 optional  oceanxray_geo.py + scene_geo_table.json     geolocating uploads
 optional  land_ocean_mask.npz                         'near land' warnings
-optional  oceanxray_context.py                        place names + weather at scene time
+optional  oceanxray_context.py + oceanxray_context_data.bin   place names + weather; keep both together
+optional  oceanxray_bathy.py + oceanxray_bathy_grid.bin  sea-floor depth (GEBCO); keep both together
+optional  oceanxray_sea.py + oceanxray_sea_data.bin   waves + sea temperature, June 2021 (ERA5); keep both together
 optional  real_internal_wave_detections_v2.parquet    detection spots on the maps
           (falls back to real_internal_wave_detections.parquet, old model)
 optional  sar_era5_sst_spatial_matches_june.parquet   SST/wind map tab
@@ -52,6 +54,11 @@ try:
     import oceanxray_context as ctx   # place names + scene-time weather
 except ImportError:                   # dashboard still works, with coordinates only
     ctx = None
+
+try:
+    import oceanxray_sea as sea       # June 2021 waves + sea temperature (ERA5), works offline
+except ImportError:                   # dashboard still works; those two values stay "n/a"
+    sea = None
 
 try:
     import oceanxray_bathy as bathy   # GEBCO sea-floor depth (embedded grid)
@@ -656,6 +663,11 @@ def show_conditions(tile_info):
         shown = monthly
     else:
         shown = cond
+    when = ctx.parse_scene_time(tile_info["time"])
+    local = sea.sea_state(lat, lon, when) if (sea is not None and when is not None) else None
+    if shown is None and local is not None:
+        shown, monthly = {}, None        # weather service unavailable; still show waves + sea temperature
+        cond = {"source": None, "hour_utc": local["hour_utc"]}
     if shown is None:
         st.info(f"Weather for this date isn't available right now: {short_reason(err)}.")
         if err:
@@ -669,17 +681,27 @@ def show_conditions(tile_info):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Wind" + (f" (from {ctx.compass(wind_dir)})" if wind_dir is not None else ""),
               num(shown.get("wind_ms"), ".1f", " m/s"))
+    live = shown if monthly is None else {}
+    wave_h = live.get("wave_h") if live.get("wave_h") is not None else (local or {}).get("wave_h")
+    wave_t = live.get("wave_t") if live.get("wave_h") is not None else (local or {}).get("wave_t")
+    sst_c = (local or {}).get("sst_c")
+    if sst_c is None:
+        sst_c = shown.get("sst_c")
+    c2.metric("Waves (height · period)",
+              "n/a" if wave_h is None else f"{wave_h:.1f} m · {num(wave_t, '.0f', ' s')}")
     if monthly is None:
-        c2.metric("Waves (height · period)",
-                  "n/a" if shown.get("wave_h") is None else
-                  f"{shown['wave_h']:.1f} m · {num(shown.get('wave_t'), '.0f', ' s')}")
-        c4.metric("Cloud · rain", f"{num(shown.get('cloud_pct'), '.0f', '%')} · {num(shown.get('rain_mm'), '.1f', ' mm/h')}")
+        c4.metric("Cloud · rain", f"{num(live.get('cloud_pct'), '.0f', '%')} · {num(live.get('rain_mm'), '.1f', ' mm/h')}")
     else:
-        c2.metric("Waves (height · period)", "n/a")
         c4.metric("Cloud · rain", "n/a")
-    c3.metric("Sea-surface temperature", num(shown.get("sst_c"), ".1f", " °C"))
+    c3.metric("Sea-surface temperature", num(sst_c, ".1f", " °C"))
+    if local is not None:
+        st.caption("Waves and sea temperature: " + local["note"] + ". Contains modified Copernicus Climate "
+                   "Change Service information (ERA5).")
 
-    if monthly is None:
+    if monthly is None and cond["source"] is None:
+        st.caption(f"Wind, cloud and rain unavailable right now ({short_reason(err)}); waves and sea temperature are "
+                   "from our own ERA5 data.")
+    elif monthly is None:
         st.caption(f"{cond['source']} · nearest hour {cond['hour_utc'].replace('T', ' ')} UTC · about 25 km grid cell at "
                    "the tile centre. Reanalysis values (a model constrained by observations), not a "
                    "measurement at the exact spot. Weather data by Open-Meteo.com (CC BY 4.0).")
@@ -687,8 +709,9 @@ def show_conditions(tile_info):
             with st.expander("Some values were unavailable"):
                 st.code(err)
     else:
-        st.caption(f"Live weather unavailable ({short_reason(err)}). Showing the June 2021 monthly average "
-                   f"from our own ERA5 / SST data within ~55 km ({monthly['n']} patches), not this exact day.")
+        st.caption(f"Live weather unavailable ({short_reason(err)}). Wind is the June 2021 monthly average "
+                   f"from our own ERA5 data within ~55 km ({monthly['n']} patches), not this exact day."
+                   + (" Waves and sea temperature are for the scene time." if local is not None else ""))
         if err:
             with st.expander("Technical detail"):
                 st.code(err)
